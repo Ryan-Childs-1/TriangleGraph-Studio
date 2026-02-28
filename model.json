@@ -1,0 +1,55 @@
+{
+  "version": "trianglegraph-text2image-v1",
+  "palettes": {
+    "sunset": [
+      "#2b1d45",
+      "#7c2d6a",
+      "#d0495a",
+      "#f39c5a",
+      "#f9e2af"
+    ],
+    "ocean": [
+      "#031926",
+      "#0b4f6c",
+      "#00a6a6",
+      "#8bd7d2",
+      "#f4f9f9"
+    ],
+    "forest": [
+      "#0b1f1a",
+      "#1f5f3b",
+      "#4d8f4d",
+      "#9ac27a",
+      "#f0f3d2"
+    ],
+    "neon": [
+      "#0b0b15",
+      "#2d2a73",
+      "#ff2e88",
+      "#00f5d4",
+      "#f8f7ff"
+    ],
+    "mono": [
+      "#0a0a0a",
+      "#3a3a3a",
+      "#6a6a6a",
+      "#9a9a9a",
+      "#f2f2f2"
+    ],
+    "candy": [
+      "#2a0845",
+      "#6441a5",
+      "#ff6fb5",
+      "#ffd166",
+      "#06d6a0"
+    ]
+  },
+  "defaults": {
+    "steps": 40,
+    "neighbor_weight": 0.62,
+    "prompt_weight": 0.28,
+    "edge_preserve": 0.22,
+    "temperature": 0.85,
+    "bins": 32
+  }
+}

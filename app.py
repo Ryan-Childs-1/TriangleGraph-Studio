@@ -391,7 +391,7 @@ def prompt_field(g: TriangleGraph, palette: List[np.ndarray], prompt: str, seed:
     dx, dy = parse_light(prompt)
     # projection for "lighting direction"
     proj = dx*(x-0.5) + dy*(y-0.5)
-    proj = (proj - proj.min()) / (proj.ptp() + 1e-8)
+    proj = (proj - proj.min()) / (np.ptp(proj) + 1e-8)
 
     # a second axis for variety
     proj2 = (x + 0.6*y + 0.17*np.sin(2*math.pi*(x-y))) % 1.0
@@ -457,6 +457,144 @@ def generate_colors(model: Dict, g: TriangleGraph, prompt: str, seed: int, steps
 
     return np.clip(x, 0.0, 1.0).astype(np.float32)
 
+
+# ------------------ Preference Training (A/B) ------------------
+# Stored inside model.json:
+#   model["pref"] = { "w": [...], "feat_mean": [...], "feat_std": [...], "lr": 0.15, "l2": 0.01, "n": 0 }
+#   model["pref_pairs"] = [ { "fa": [...], "fb": [...], "y": 1.0 } , ... ]
+#
+# We keep this lightweight and deterministic. The preference model helps rank candidates in training,
+# and can optionally recommend parameter tweaks (future extension).
+
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-x))
+
+def edge_deltas(g: TriangleGraph, colors_lin: np.ndarray) -> np.ndarray:
+    if g.edges.shape[0] == 0:
+        return np.zeros((0,3), dtype=np.float32)
+    i = g.edges[:,0].astype(np.int64)
+    j = g.edges[:,1].astype(np.int64)
+    return (colors_lin[i] - colors_lin[j]).astype(np.float32)
+
+def compute_quality_features(g: TriangleGraph, colors_lin: np.ndarray) -> np.ndarray:
+    # K=12 stable features
+    d = edge_deltas(g, colors_lin)
+    if d.shape[0] == 0:
+        var = np.var(colors_lin, axis=0)
+        mean = np.mean(colors_lin, axis=0)
+        sat = float(np.mean(np.std(lin_to_srgb(colors_lin), axis=1)))
+        return np.array([
+            float(np.mean(var)), float(np.max(var)), float(np.mean(mean)), sat,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        ], dtype=np.float32)
+
+    dist = np.sqrt(np.sum(d*d, axis=1) + 1e-12)  # (E,)
+    # edge strength per edge (mean of endpoints)
+    es = np.clip(g.edge_strength.astype(np.float32), 0.0, 1.0)
+    i = g.edges[:,0].astype(np.int64); j = g.edges[:,1].astype(np.int64)
+    s = 0.5*(es[i] + es[j])
+
+    s_mean = float(np.mean(s)); d_mean = float(np.mean(dist))
+    cov = float(np.mean((s - s_mean)*(dist - d_mean)))
+    s_var = float(np.mean((s - s_mean)**2)) + 1e-8
+    d_var = float(np.mean((dist - d_mean)**2)) + 1e-8
+    corr = cov / math.sqrt(s_var*d_var)
+
+    smooth_penalty = float(np.mean((1.0 - s) * dist))
+    edge_miss_penalty = float(np.mean(s * (1.0 / (dist + 1e-3))))
+
+    var_rgb = np.var(colors_lin, axis=0)
+    mean_rgb = np.mean(colors_lin, axis=0)
+    max_var = float(np.max(var_rgb))
+    mean_var = float(np.mean(var_rgb))
+    mean_brightness = float(np.mean(mean_rgb))
+
+    sr = lin_to_srgb(np.clip(colors_lin,0.0,1.0))
+    sat = float(np.mean(np.std(sr, axis=1)))
+
+    bins = 8
+    q = np.clip((sr*(bins-1)).astype(np.int32), 0, bins-1)
+    key = q[:,0]*(bins*bins) + q[:,1]*bins + q[:,2]
+    hist = np.bincount(key, minlength=bins**3).astype(np.float32)
+    hist = hist/(np.sum(hist)+1e-8)
+    ent = float(-np.sum(hist*np.log(hist+1e-8)))
+
+    tv = float(np.mean(dist))
+    balance = float(np.std(var_rgb))
+
+    feats = np.array([
+        mean_var, max_var, mean_brightness, sat, ent, tv, corr,
+        smooth_penalty, edge_miss_penalty, balance,
+        float(np.median(dist)), float(np.quantile(dist, 0.90))
+    ], dtype=np.float32)
+    return feats
+
+def ensure_pref_in_model(model: Dict) -> Dict:
+    if "pref" not in model or not isinstance(model["pref"], dict):
+        model["pref"] = {
+            "w": [0.0]*12,
+            "feat_mean": [0.0]*12,
+            "feat_std": [1.0]*12,
+            "lr": 0.15,
+            "l2": 0.01,
+            "n": 0
+        }
+    if "pref_pairs" not in model or not isinstance(model["pref_pairs"], list):
+        model["pref_pairs"] = []
+    return model
+
+def pref_score(model: Dict, feats: np.ndarray) -> float:
+    p = model["pref"]
+    w = np.array(p["w"], dtype=np.float32)
+    mu = np.array(p["feat_mean"], dtype=np.float32)
+    sd = np.array(p["feat_std"], dtype=np.float32) + 1e-6
+    x = (feats - mu)/sd
+    return float(np.dot(w, x))
+
+def update_pref_stats(model: Dict, feats_all: np.ndarray) -> None:
+    if feats_all.shape[0] < 4:
+        return
+    model["pref"]["feat_mean"] = np.mean(feats_all, axis=0).astype(np.float32).tolist()
+    model["pref"]["feat_std"] = (np.std(feats_all, axis=0) + 1e-6).astype(np.float32).tolist()
+
+def train_pref_model(model: Dict, steps: int = 200) -> None:
+    pairs = model.get("pref_pairs", [])
+    if len(pairs) < 2:
+        model["pref"]["n"] = len(pairs)
+        return
+    A = np.stack([np.array(p["fa"], dtype=np.float32) for p in pairs], axis=0)
+    B = np.stack([np.array(p["fb"], dtype=np.float32) for p in pairs], axis=0)
+    y = np.array([float(p["y"]) for p in pairs], dtype=np.float32)
+
+    feats_all = np.concatenate([A,B], axis=0)
+    update_pref_stats(model, feats_all)
+
+    mu = np.array(model["pref"]["feat_mean"], dtype=np.float32)
+    sd = np.array(model["pref"]["feat_std"], dtype=np.float32) + 1e-6
+    Az = (A - mu[None,:])/sd[None,:]
+    Bz = (B - mu[None,:])/sd[None,:]
+    X = Az - Bz
+
+    w = np.array(model["pref"]["w"], dtype=np.float32)
+    lr = float(model["pref"].get("lr", 0.15))
+    l2 = float(model["pref"].get("l2", 0.01))
+    n = X.shape[0]
+
+    for _ in range(int(steps)):
+        logits = X @ w
+        p = sigmoid(logits)
+        grad = (X.T @ (p - y)) / max(1.0, float(n)) + l2*w
+        w = w - lr*grad.astype(np.float32)
+
+    model["pref"]["w"] = w.astype(np.float32).tolist()
+    model["pref"]["n"] = len(pairs)
+
+def save_model_json(model: Dict) -> None:
+    # Writes to local working directory (Streamlit Cloud writable at runtime)
+    with open("model.json","w",encoding="utf-8") as f:
+        json.dump(model, f, indent=2)
+
 # ============================================================
 # Streamlit App
 # ============================================================
@@ -471,9 +609,9 @@ def load_model() -> Dict:
     with open("model.json","r",encoding="utf-8") as f:
         return json.load(f)
 
-MODEL = load_model()
+MODEL = ensure_pref_in_model(load_model())
 
-tab1, tab2 = st.tabs(["Text → Image", "Image → Triangle Mosaic"])
+tab1, tab2, tab3 = st.tabs(["Text → Image", "Image → Triangle Mosaic", "Train (A/B)"])
 
 # -------------------- Text → Image --------------------
 with tab1:
@@ -594,6 +732,143 @@ with tab2:
 
             st.image(png, use_container_width=True)
             st.download_button("Download PNG", data=png, file_name="trianglegraph_from_image.png", mime="image/png", use_container_width=True)
+
+
+# -------------------- Train (A/B) --------------------
+with tab3:
+    st.subheader("Train (A/B Preferences)")
+    st.write(
+        "Generate two candidates **A** and **B** and pick which one is better. "
+        "Your choices train a small preference model that is saved into **model.json**."
+    )
+
+    # Training controls
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        t_width = st.select_slider("Width", options=[384, 512, 640, 768, 896, 1024], value=768, key="t_w")
+    with c2:
+        t_height = st.select_slider("Height", options=[384, 512, 640, 768, 896, 1024], value=768, key="t_h")
+    with c3:
+        t_complexity = st.slider("Complexity", 1, 10, 6, 1, key="t_c")
+    with c4:
+        t_seed = st.number_input("Base seed", min_value=0, max_value=10_000_000, value=9001, step=1, key="t_seed")
+
+    t_prompt = st.text_input("Prompt", value="neon cyber stained glass, light from top-right", key="t_prompt")
+
+    st.markdown("### Style exploration")
+    s1, s2, s3, s4, s5 = st.columns(5)
+    with s1:
+        t_steps = st.slider("Steps", 10, 120, int(MODEL["defaults"]["steps"]), 1, key="t_steps")
+    with s2:
+        t_neighbor = st.slider("Neighbor smooth", 0.10, 0.90, float(MODEL["defaults"]["neighbor_weight"]), 0.01, key="t_nei")
+    with s3:
+        t_promptw = st.slider("Prompt pull", 0.00, 0.60, float(MODEL["defaults"]["prompt_weight"]), 0.01, key="t_pp")
+    with s4:
+        t_edgep = st.slider("Edge preserve", 0.00, 0.70, float(MODEL["defaults"]["edge_preserve"]), 0.01, key="t_ep")
+    with s5:
+        t_temp = st.slider("Randomness", 0.10, 1.40, float(MODEL["defaults"]["temperature"]), 0.05, key="t_tmp")
+
+    st.markdown("### Preference model settings")
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        MODEL["pref"]["lr"] = st.slider("Pref learning rate", 0.02, 0.50, float(MODEL["pref"].get("lr", 0.15)), 0.01, key="p_lr")
+    with p2:
+        MODEL["pref"]["l2"] = st.slider("Pref L2", 0.0, 0.20, float(MODEL["pref"].get("l2", 0.01)), 0.005, key="p_l2")
+    with p3:
+        train_steps = st.slider("Train steps per click", 50, 600, 200, 25, key="p_steps")
+
+    diag_mode = st.selectbox("Diagonal mode", ["Random","Alternate","TL-BR","TR-BL"], index=0, key="t_diag")
+
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        t_gap = st.slider("Whitespace gap (px)", 0.0, 28.0, 10.0, 0.5, key="t_gap")
+    with r2:
+        t_bg = st.radio("Background", ["White","Black"], horizontal=True, key="t_bg")
+    with r3:
+        t_outline = st.checkbox("Outlines", value=False, key="t_out")
+        t_opx = st.slider("Outline width", 1, 5, 1, 1, key="t_opx") if t_outline else 1
+        t_oal = st.slider("Outline opacity", 0.05, 1.0, 0.25, 0.01, key="t_oal") if t_outline else 0.25
+
+    # Procedural graph params
+    min_cell = int(max(10, 70 - 5*t_complexity))
+    max_depth = int(min(9, 3 + t_complexity//2))
+    split_prob = float(np.clip(0.35 + 0.06*t_complexity, 0.35, 0.92))
+
+    gen_pair = st.button("Generate A/B pair", type="primary", use_container_width=True)
+
+    if gen_pair:
+        with st.spinner("Generating A and B…"):
+            g = build_procedural_graph(int(t_width), int(t_height),
+                                       ProcParams(min_cell=min_cell, max_depth=max_depth, split_prob=split_prob, diag_mode=diag_mode),
+                                       seed=int(t_seed))
+
+            # Candidate A
+            colors_a = generate_colors(MODEL, g, prompt=t_prompt, seed=int(t_seed)+7, steps=int(t_steps),
+                                       neighbor_w=float(t_neighbor), prompt_w=float(t_promptw),
+                                       edge_preserve=float(t_edgep), temperature=float(t_temp))
+            img_a = render_mosaic(g, colors_a, gap_px=float(t_gap), background=t_bg, outline=t_outline, outline_px=int(t_opx), outline_alpha=float(t_oal))
+            fa = compute_quality_features(g, colors_a)
+
+            # Candidate B (perturb seed a bit)
+            colors_b = generate_colors(MODEL, g, prompt=t_prompt, seed=int(t_seed)+1007, steps=int(t_steps),
+                                       neighbor_w=float(np.clip(t_neighbor + 0.03, 0.10, 0.90)),
+                                       prompt_w=float(np.clip(t_promptw + 0.02, 0.0, 0.60)),
+                                       edge_preserve=float(t_edgep), temperature=float(t_temp))
+            img_b = render_mosaic(g, colors_b, gap_px=float(t_gap), background=t_bg, outline=t_outline, outline_px=int(t_opx), outline_alpha=float(t_oal))
+            fb = compute_quality_features(g, colors_b)
+
+            # Store in session (small: store PNG bytes + features)
+            buf = io.BytesIO(); img_a.save(buf, format="PNG"); a_png = buf.getvalue()
+            buf = io.BytesIO(); img_b.save(buf, format="PNG"); b_png = buf.getvalue()
+
+        st.session_state["ab_pair"] = {"a_png": a_png, "b_png": b_png, "fa": fa.tolist(), "fb": fb.tolist()}
+        st.success("Pair generated. Choose A or B below.")
+
+    pair = st.session_state.get("ab_pair")
+    if pair is not None:
+        a_sc = pref_score(MODEL, np.array(pair["fa"], dtype=np.float32))
+        b_sc = pref_score(MODEL, np.array(pair["fb"], dtype=np.float32))
+
+        cA, cB = st.columns(2, gap="large")
+        with cA:
+            st.markdown(f"## A (score {a_sc:.3f})")
+            st.image(pair["a_png"], use_container_width=True)
+        with cB:
+            st.markdown(f"## B (score {b_sc:.3f})")
+            st.image(pair["b_png"], use_container_width=True)
+
+        b1, b2, b3 = st.columns(3)
+        choose_a = b1.button("✅ A is better", use_container_width=True)
+        choose_b = b2.button("✅ B is better", use_container_width=True)
+        clear = b3.button("↩ Clear", use_container_width=True)
+
+        if choose_a or choose_b:
+            entry = {"fa": pair["fa"], "fb": pair["fb"], "y": 1.0 if choose_a else 0.0}
+            MODEL["pref_pairs"].append(entry)
+            with st.spinner("Training preference model & saving…"):
+                train_pref_model(MODEL, steps=int(train_steps))
+                save_model_json(MODEL)
+            st.success(f"Saved. Comparisons: {len(MODEL['pref_pairs'])} • pref n={MODEL['pref']['n']}")
+            st.session_state.pop("ab_pair", None)
+
+        if clear:
+            st.session_state.pop("ab_pair", None)
+
+    st.divider()
+    st.markdown("### Save / Export")
+    colS1, colS2 = st.columns(2)
+    with colS1:
+        if st.button("Save model.json now", use_container_width=True):
+            save_model_json(MODEL)
+            st.success("Saved model.json")
+    with colS2:
+        # Provide download of current model.json
+        model_bytes = json.dumps(MODEL, indent=2).encode("utf-8")
+        st.download_button("Download model.json", data=model_bytes, file_name="model.json", mime="application/json", use_container_width=True)
+
+    st.markdown("### Preference status")
+    st.write({"comparisons": len(MODEL.get("pref_pairs", [])), "pref": MODEL.get("pref", {})})
+
 
 with st.expander("Notes / Why this won't crash like before", expanded=False):
     st.write(

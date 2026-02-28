@@ -1,5 +1,5 @@
 {
-  "version": "trianglegraph-text2image-v1",
+  "version": "trianglegraph-text2image-v2",
   "palettes": {
     "sunset": [
       "#2b1d45",
@@ -50,7 +50,13 @@
     "prompt_weight": 0.28,
     "edge_preserve": 0.22,
     "temperature": 0.85,
-    "bins": 32
+    "bins": 32,
+    "style": "stained_glass",
+    "multi_scale": 0.55,
+    "quantize_strength": 0.45,
+    "micro_texture": 0.22,
+    "contrast_boost": 0.08,
+    "auto_tune_defaults": true
   },
   "pref": {
     "w": [
@@ -99,5 +105,80 @@
     "l2": 0.01,
     "n": 0
   },
-  "pref_pairs": []
+  "pref_pairs": [],
+  "prompt_keywords": {
+    "ocean": [
+      "ocean",
+      "sea",
+      "water",
+      "wave",
+      "navy",
+      "blue",
+      "marine",
+      "lagoon"
+    ],
+    "forest": [
+      "forest",
+      "jungle",
+      "green",
+      "moss",
+      "tree",
+      "woodland"
+    ],
+    "sunset": [
+      "sunset",
+      "dawn",
+      "golden",
+      "warm",
+      "desert",
+      "ember",
+      "twilight"
+    ],
+    "neon": [
+      "neon",
+      "cyber",
+      "synth",
+      "vapor",
+      "glow",
+      "electric"
+    ],
+    "mono": [
+      "black and white",
+      "monochrome",
+      "mono",
+      "grayscale",
+      "noir"
+    ],
+    "candy": [
+      "candy",
+      "pastel",
+      "sweet",
+      "bubblegum",
+      "cotton"
+    ]
+  },
+  "styles": {
+    "stained_glass": {
+      "quantize_strength": 0.55,
+      "lead_line_strength": 0.35,
+      "micro_texture": 0.25,
+      "contrast_boost": 0.1
+    },
+    "mosaic": {
+      "quantize_strength": 0.35,
+      "lead_line_strength": 0.2,
+      "micro_texture": 0.18,
+      "contrast_boost": 0.06
+    },
+    "soft": {
+      "quantize_strength": 0.15,
+      "lead_line_strength": 0.08,
+      "micro_texture": 0.1,
+      "contrast_boost": 0.03
+    }
+  },
+  "training": {
+    "tune_rate": 0.05,
+    "max_history": 4000
+  }
 }

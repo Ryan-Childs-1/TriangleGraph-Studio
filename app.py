@@ -1,29 +1,26 @@
-import io, json, math, hashlib
+import io, json, math, hashlib, time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageOps
 
 # ============================================================
-# TriangleGraph Text-to-Image (No Torch)
-# - Generates ONE image per click (to avoid crashes)
-# - Text prompt -> palette + seed + directional light
-# - Procedural triangle graph -> lightweight generative model
+# TriangleGraph Text-to-Image (No Torch) — v2 (Best effort)
+# ============================================================
+# Goals:
+# - Better prompt conditioning (palette + structure + lighting)
+# - Better "stained glass" look (soft quantization + micro texture)
+# - Edge-aware anisotropic smoothing on triangle-graph
+# - Training (A/B): preference model + optional auto-tuning defaults
+# - Text tab generates ONE image per click (low crash risk)
 # ============================================================
 
 # ------------------ Utility ------------------
 
 def clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
-
-def hex_to_rgb01(h: str) -> np.ndarray:
-    h = h.strip().lstrip("#")
-    if len(h) != 6:
-        return np.array([0.5, 0.5, 0.5], dtype=np.float32)
-    r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
-    return np.array([r, g, b], dtype=np.float32) / 255.0
 
 def float_to_u8(x: np.ndarray) -> np.ndarray:
     return (np.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
@@ -39,6 +36,13 @@ def lin_to_srgb(c: np.ndarray) -> np.ndarray:
     a = 0.055
     return np.where(c <= 0.0031308, 12.92 * c, (1 + a) * (c ** (1 / 2.4)) - a)
 
+def hex_to_rgb01(h: str) -> np.ndarray:
+    h = h.strip().lstrip("#")
+    if len(h) != 6:
+        return np.array([0.5, 0.5, 0.5], dtype=np.float32)
+    r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
+    return np.array([r, g, b], dtype=np.float32) / 255.0
+
 def stable_hash_int(s: str, mod: int = 2**31-1) -> int:
     h = hashlib.sha256(s.encode("utf-8")).digest()
     return int.from_bytes(h[:8], "little") % mod
@@ -50,14 +54,10 @@ def resize_keep_aspect(img: Image.Image, max_side: int) -> Image.Image:
     s = max_side / max(w, h)
     return img.resize((int(round(w * s)), int(round(h * s))), Image.LANCZOS)
 
-# ------------------ Geometry ------------------
+# ------------------ Geometry / Graph ------------------
 
 def tri_centroid(t: np.ndarray) -> np.ndarray:
     return np.mean(t.astype(np.float32), axis=0)
-
-def tri_area(t: np.ndarray) -> float:
-    a, b, c = t.astype(np.float32)
-    return float(abs(np.cross(b - a, c - a)) * 0.5)
 
 def tri_min_edge(t: np.ndarray) -> float:
     p = t.astype(np.float32)
@@ -82,28 +82,26 @@ def _edge_key(p1: np.ndarray, p2: np.ndarray) -> Tuple[int,int,int,int]:
         return (a[0], a[1], b[0], b[1])
     return (b[0], b[1], a[0], a[1])
 
-# ------------------ Graph ------------------
-
 @dataclass
 class TriangleGraph:
     width: int
     height: int
-    tris: np.ndarray      # (N,3,2) float32
-    edges: np.ndarray     # (E,2) int64
-    edge_strength: np.ndarray  # (N,) float32  synthetic edge strength per triangle
+    tris: np.ndarray          # (N,3,2) float32
+    edges: np.ndarray         # (E,2) int64
+    edge_strength: np.ndarray # (N,) float32 0..1
 
 def build_edges_from_tris(tris: np.ndarray) -> np.ndarray:
     local_edges = [(0,1),(1,2),(2,0)]
-    edge_dict: Dict[Tuple[int,int,int,int], Tuple[int,int]] = {}
+    edge_dict = {}
     pairs = []
     for ti in range(tris.shape[0]):
         t = tris[ti]
-        for le,(a,b) in enumerate(local_edges):
+        for (a,b) in local_edges:
             key = _edge_key(t[a], t[b])
             if key not in edge_dict:
-                edge_dict[key] = (ti, le)
+                edge_dict[key] = ti
             else:
-                tj,_ = edge_dict[key]
+                tj = edge_dict[key]
                 if tj != ti:
                     pairs.append((tj, ti))
                 del edge_dict[key]
@@ -114,20 +112,17 @@ def build_edges_from_tris(tris: np.ndarray) -> np.ndarray:
 def build_neighbor_lists(edges: np.ndarray, N: int) -> List[List[int]]:
     nbr = [[] for _ in range(N)]
     for i,j in edges.astype(np.int64):
-        nbr[int(i)].append(int(j))
-        nbr[int(j)].append(int(i))
+        nbr[int(i)].append(int(j)); nbr[int(j)].append(int(i))
     return nbr
 
 # ------------------ Procedural triangulation ------------------
-# A quadtree-like split controlled by "complexity" and seed.
-# This avoids needing an input image for geometry.
 
 @dataclass
 class ProcParams:
     min_cell: int
     max_depth: int
     split_prob: float
-    diag_mode: str  # Random / Alternate / TL-BR / TR-BL
+    diag_mode: str
 
 def rect_to_tris(rect: Tuple[int,int,int,int], diag_mode: str, rng: np.random.Generator) -> List[np.ndarray]:
     x0,y0,x1,y1 = rect
@@ -150,6 +145,7 @@ def rect_to_tris(rect: Tuple[int,int,int,int], diag_mode: str, rng: np.random.Ge
         t2 = np.stack([p10,p11,p01],0)
     return [t1,t2]
 
+@st.cache_data(show_spinner=False, max_entries=64)
 def build_procedural_graph(width: int, height: int, params: ProcParams, seed: int) -> TriangleGraph:
     rng = np.random.default_rng(int(seed))
     leaves: List[Tuple[int,int,int,int]] = []
@@ -158,7 +154,6 @@ def build_procedural_graph(width: int, height: int, params: ProcParams, seed: in
         rw, rh = x1-x0, y1-y0
         if rw <= params.min_cell or rh <= params.min_cell or depth >= params.max_depth:
             leaves.append((x0,y0,x1,y1)); return
-        # split decision: probability + a little spatial noise
         cx = (x0+x1)/2; cy = (y0+y1)/2
         spatial = 0.5 + 0.5*math.sin(0.015*cx + 0.02*cy + 2.0*rng.random())
         p = params.split_prob * (0.65 + 0.35*spatial)
@@ -181,22 +176,20 @@ def build_procedural_graph(width: int, height: int, params: ProcParams, seed: in
     tris = np.stack(tris,0).astype(np.float32)
 
     edges = build_edges_from_tris(tris)
-    N = tris.shape[0]
-    # synthetic edge strength: higher near "guiding lines" to create structure
     ctrs = np.mean(tris, axis=1)  # (N,2)
     x = ctrs[:,0] / max(1.0,width)
     y = ctrs[:,1] / max(1.0,height)
-    # create 2–3 sine-based bands
     band1 = np.abs(np.sin(2*math.pi*(1.5*x + 0.7*y + 0.13)))
     band2 = np.abs(np.sin(2*math.pi*(0.6*x - 1.2*y + 0.41)))
-    edge_strength = (0.55*band1 + 0.45*band2).astype(np.float32)
+    band3 = np.abs(np.sin(2*math.pi*(1.1*x + 1.1*y + 0.77)))
+    edge_strength = (0.42*band1 + 0.33*band2 + 0.25*band3).astype(np.float32)
     edge_strength = np.clip(edge_strength, 0.0, 1.0)
 
     return TriangleGraph(width=width, height=height, tris=tris, edges=edges, edge_strength=edge_strength)
 
 # ------------------ Rendering ------------------
 
-def render_mosaic(g: TriangleGraph, colors_lin: np.ndarray, gap_px: float, background: str, outline: bool, outline_px: int, outline_alpha: float) -> Image.Image:
+def render_mosaic(g: TriangleGraph, colors_lin: np.ndarray, gap_px: float, background: str, outline: bool, outline_px: int, outline_alpha: float, lead_line_strength: float = 0.0) -> Image.Image:
     w,h = g.width, g.height
     bg = (255,255,255,255) if background == "White" else (0,0,0,255)
     canvas = Image.new("RGBA", (w,h), bg)
@@ -210,17 +203,221 @@ def render_mosaic(g: TriangleGraph, colors_lin: np.ndarray, gap_px: float, backg
         oa = int(round(255*clamp01(outline_alpha)))
         outline_rgba = (0,0,0,oa) if background == "White" else (255,255,255,oa)
 
+    # "lead lines" darker near strong edges
+    lead = np.clip(g.edge_strength.astype(np.float32), 0.0, 1.0)
+    lead = (lead_line_strength * lead).astype(np.float32)
+
     for i in range(g.tris.shape[0]):
         t = g.tris[i]
         ts = shrink_triangle(t, float(gap_px))
         poly = [(float(p[0]), float(p[1])) for p in ts]
-        fill = (int(cu8[i,0]), int(cu8[i,1]), int(cu8[i,2]), 255)
+
+        # darken color slightly if lead strength high
+        c = cu8[i].astype(np.float32)/255.0
+        c = np.clip(c*(1.0 - 0.25*lead[i]), 0.0, 1.0)
+        fill = (int(c[0]*255+0.5), int(c[1]*255+0.5), int(c[2]*255+0.5), 255)
         draw.polygon(poly, fill=fill)
+
         if outline_rgba is not None and outline_px>0:
             draw.line(poly+[poly[0]], fill=outline_rgba, width=int(outline_px), joint="curve")
+
     return canvas
 
-# ------------------ Image->Graph (optional) ------------------
+# ------------------ Prompt parsing ------------------
+
+def parse_light(prompt: str) -> Tuple[float,float]:
+    p = prompt.lower()
+    dx, dy = -0.7, -0.7
+    # explicit directional phrases
+    if "light from left" in p or "from left" in p: dx, dy = -1.0, 0.0
+    if "light from right" in p or "from right" in p: dx, dy = 1.0, 0.0
+    if "light from above" in p or "from above" in p or "from top" in p: dx, dy = 0.0, -1.0
+    if "light from below" in p or "from below" in p or "from bottom" in p: dx, dy = 0.0, 1.0
+    if "top-right" in p: dx, dy = 0.7, -0.7
+    if "bottom-right" in p: dx, dy = 0.7, 0.7
+    if "bottom-left" in p: dx, dy = -0.7, 0.7
+    return float(dx), float(dy)
+
+def detect_style(model: Dict, prompt: str) -> str:
+    p = prompt.lower()
+    if "stained glass" in p or "glass" in p: return "stained_glass"
+    if "mosaic" in p: return "mosaic"
+    if "soft" in p or "dreamy" in p: return "soft"
+    # fallback to defaults
+    return str(model.get("defaults", {}).get("style", "stained_glass"))
+
+def pick_palette(model: Dict, prompt: str) -> List[np.ndarray]:
+    p = prompt.lower()
+    pal = model.get("palettes", {})
+    kw = model.get("prompt_keywords", {})
+
+    key = None
+    for k, words in kw.items():
+        if any(w in p for w in words) and k in pal:
+            key = k
+            break
+    if key is None:
+        keys = list(pal.keys())
+        if not keys:
+            return [srgb_to_lin(np.array([0.5,0.5,0.5], np.float32))]
+        key = keys[stable_hash_int(prompt) % len(keys)]
+
+    return [srgb_to_lin(hex_to_rgb01(hx)) for hx in pal[key]]
+
+# ------------------ Noise / multi-scale fields ------------------
+
+def rand_unit_vec2(rng: np.random.Generator) -> Tuple[float,float]:
+    a = float(rng.uniform(0.0, 2*math.pi))
+    return math.cos(a), math.sin(a)
+
+def fbm_noise_2d(x: np.ndarray, y: np.ndarray, seed: int, octaves: int = 4) -> np.ndarray:
+    # lightweight fBm using sine/cosine warps (fast & stable)
+    rng = np.random.default_rng(int(seed))
+    out = np.zeros_like(x, dtype=np.float32)
+    amp = 1.0
+    freq = 1.0
+    for _ in range(int(octaves)):
+        ux, uy = rand_unit_vec2(rng)
+        phase = float(rng.uniform(0.0, 10.0))
+        out += amp * np.sin(2*math.pi*(freq*(ux*x + uy*y) + phase)).astype(np.float32)
+        amp *= 0.5
+        freq *= 2.0
+    # normalize to 0..1
+    mn = float(np.min(out)); mx = float(np.max(out))
+    return ((out - mn) / (mx - mn + 1e-8)).astype(np.float32)
+
+def prompt_field(g: TriangleGraph, palette: List[np.ndarray], prompt: str, seed: int, multi_scale: float) -> np.ndarray:
+    rng = np.random.default_rng(int(seed))
+    ctr = np.mean(g.tris, axis=1)  # (N,2)
+    x = (ctr[:,0] / max(1.0,g.width)).astype(np.float32)
+    y = (ctr[:,1] / max(1.0,g.height)).astype(np.float32)
+
+    dx, dy = parse_light(prompt)
+    proj = dx*(x-0.5) + dy*(y-0.5)
+    proj = (proj - float(np.min(proj))) / (float(np.ptp(proj)) + 1e-8)
+
+    # secondary axis & fBm texture
+    proj2 = (x + 0.6*y + 0.17*np.sin(2*math.pi*(x-y))).astype(np.float32)
+    proj2 = (proj2 - float(np.min(proj2))) / (float(np.ptp(proj2)) + 1e-8)
+
+    n = fbm_noise_2d(x, y, seed=seed+777, octaves=4)
+    t = (0.55*proj + 0.25*proj2 + float(multi_scale)*0.20*n).astype(np.float32)
+    t = np.clip(t, 0.0, 0.999999)
+
+    K = len(palette)
+    pos = t*(K-1)
+    i0 = np.floor(pos).astype(np.int32)
+    i1 = np.clip(i0+1, 0, K-1)
+    a = (pos - i0.astype(np.float32)).astype(np.float32)
+
+    pal0 = np.stack([palette[i] for i in i0], 0)
+    pal1 = np.stack([palette[i] for i in i1], 0)
+    base = (1-a)[:,None]*pal0 + a[:,None]*pal1
+
+    tex = rng.normal(0.0, 0.02, size=base.shape).astype(np.float32)
+    return np.clip(base + tex, 0.0, 1.0).astype(np.float32)
+
+# ------------------ Soft quantization to palette ------------------
+
+def soft_quantize(colors: np.ndarray, palette: np.ndarray, strength: float) -> np.ndarray:
+    """
+    Pull colors toward palette via softmax weights (still smooth).
+    strength: 0..1
+    """
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if palette.shape[0] < 2 or strength <= 1e-6:
+        return colors
+    # distance in linear RGB
+    # weights = softmax(-d2 / tau)
+    tau = 0.08 + 0.22*(1.0-strength)  # smaller tau => sharper to palette
+    d2 = np.sum((colors[:,None,:] - palette[None,:,:])**2, axis=2)  # (N,K)
+    w = np.exp(-d2 / (tau + 1e-8))
+    w = w / (np.sum(w, axis=1, keepdims=True) + 1e-8)
+    q = w @ palette  # (N,3)
+    return (1.0-strength)*colors + strength*q
+
+# ------------------ Generation Model (edge-aware anisotropic smoothing) ------------------
+
+def generate_colors(
+    model: Dict,
+    g: TriangleGraph,
+    prompt: str,
+    seed: int,
+    steps: int,
+    neighbor_w: float,
+    prompt_w: float,
+    edge_preserve: float,
+    temperature: float,
+    multi_scale: float,
+    quantize_strength: float,
+    micro_texture: float,
+    contrast_boost: float,
+) -> np.ndarray:
+    rng = np.random.default_rng(int(seed))
+    N = g.tris.shape[0]
+    nbr = build_neighbor_lists(g.edges, N)
+
+    palette_list = pick_palette(model, prompt)
+    palette = np.stack(palette_list, axis=0).astype(np.float32)
+
+    pf = prompt_field(g, palette_list, prompt, seed=seed+1234, multi_scale=multi_scale)
+
+    # init with prompt-biased noise
+    x = np.clip(pf + rng.normal(0.0, 0.22*temperature, size=(N,3)).astype(np.float32), 0.0, 1.0)
+
+    es = np.clip(g.edge_strength.astype(np.float32), 0.0, 1.0)
+    resist = float(edge_preserve) * es  # 0..edge_preserve
+
+    # micro texture (glass grain): fixed per triangle, not per step
+    grain = rng.normal(0.0, 1.0, size=(N,3)).astype(np.float32)
+    grain = grain / (np.std(grain) + 1e-6)
+
+    for t in range(int(steps)):
+        x_new = x.copy()
+
+        # neighbor mean + anisotropic mixing
+        for i in range(N):
+            ns = nbr[i]
+            if ns:
+                m = np.mean(x[ns], axis=0)
+                # anisotropic: weigh by similarity to prevent bleeding across "edges"
+                # compute similarity weights quickly (few neighbors)
+                arr = x[ns]
+                d2 = np.sum((arr - x[i][None,:])**2, axis=1)
+                wsim = np.exp(-d2 / 0.06)
+                wsim = wsim / (np.sum(wsim) + 1e-8)
+                m = (wsim[:,None] * arr).sum(axis=0)
+            else:
+                m = x[i]
+
+            w_smooth = float(neighbor_w) * (1.0 - resist[i])
+            x_new[i] = (1.0 - w_smooth - float(prompt_w)) * x[i] + w_smooth * m + float(prompt_w) * pf[i]
+
+        # edge-driven contrast: push apart on strong-edge connections
+        if g.edges.shape[0] > 0 and contrast_boost > 1e-6:
+            i = g.edges[:,0].astype(np.int64); j = g.edges[:,1].astype(np.int64)
+            d = x_new[i] - x_new[j]
+            push = (float(contrast_boost) * 0.35 * (es[i] + es[j]) / 2.0)[:,None]
+            x_new[i] = np.clip(x_new[i] + push * d, 0.0, 1.0)
+            x_new[j] = np.clip(x_new[j] - push * d, 0.0, 1.0)
+
+        # mild annealed noise
+        sigma = (0.018 * temperature) * (1.0 - (t / max(1, steps-1)) * 0.65)
+        x_new = np.clip(x_new + rng.normal(0.0, sigma, size=x_new.shape).astype(np.float32), 0.0, 1.0)
+
+        # soft quantize every few steps to pull toward palette (stained glass feel)
+        if (t % 4) == 0 and quantize_strength > 1e-6:
+            x_new = np.clip(soft_quantize(x_new, palette, strength=quantize_strength), 0.0, 1.0)
+
+        x = x_new
+
+    # add micro texture at end (subtle)
+    if micro_texture > 1e-6:
+        x = np.clip(x + float(micro_texture) * 0.06 * grain, 0.0, 1.0)
+
+    return x.astype(np.float32)
+
+# ------------------ Image -> Triangle Mosaic (optional) ------------------
 
 def sobel_edge_strength(rgb_u8: np.ndarray) -> np.ndarray:
     x = u8_to_float(rgb_u8)
@@ -239,7 +436,7 @@ def sobel_edge_strength(rgb_u8: np.ndarray) -> np.ndarray:
         ky[2,0]*p[2:,:-2] + ky[2,1]*p[2:,1:-1] + ky[2,2]*p[2:,2:]
     )
     mag = np.sqrt(gx*gx + gy*gy)
-    hi = np.quantile(mag, 0.995) + 1e-8
+    hi = float(np.quantile(mag, 0.995)) + 1e-8
     return np.clip(mag/hi, 0.0, 1.0).astype(np.float32)
 
 @dataclass
@@ -315,8 +512,6 @@ def build_graph_from_image(img: Image.Image, qp: QuadParams, seed: int) -> Tuple
     tris = np.stack(tris,0).astype(np.float32)
     edges = build_edges_from_tris(tris)
     N = tris.shape[0]
-
-    # triangle colors from image (linear)
     cols = np.zeros((N,3), np.float32)
     es = np.zeros((N,), np.float32)
     for i in range(N):
@@ -328,143 +523,7 @@ def build_graph_from_image(img: Image.Image, qp: QuadParams, seed: int) -> Tuple
         es[i] = float(edge[cy,cx])
     return TriangleGraph(width=w, height=h, tris=tris, edges=edges, edge_strength=es), cols
 
-# ------------------ Text->Palette + Light ------------------
-
-def parse_light(prompt: str) -> Tuple[float,float]:
-    p = prompt.lower()
-    # default: top-left
-    dx, dy = -0.7, -0.7
-    if "light from left" in p or "from left" in p:
-        dx, dy = -1.0, 0.0
-    if "light from right" in p or "from right" in p:
-        dx, dy = 1.0, 0.0
-    if "light from above" in p or "from above" in p or "from top" in p:
-        dx, dy = 0.0, -1.0
-    if "light from below" in p or "from below" in p or "from bottom" in p:
-        dx, dy = 0.0, 1.0
-    if "top-right" in p:
-        dx, dy = 0.7, -0.7
-    if "bottom-right" in p:
-        dx, dy = 0.7, 0.7
-    if "bottom-left" in p:
-        dx, dy = -0.7, 0.7
-    return dx, dy
-
-def pick_palette(model: Dict, prompt: str) -> List[np.ndarray]:
-    p = prompt.lower()
-    pal = model["palettes"]
-
-    # keyword routing
-    if any(k in p for k in ["ocean","sea","water","wave","navy","blue"]): key="ocean"
-    elif any(k in p for k in ["forest","jungle","green","moss","tree"]): key="forest"
-    elif any(k in p for k in ["neon","cyber","synth","vapor","glow"]): key="neon"
-    elif any(k in p for k in ["sunset","dawn","golden","warm","desert"]): key="sunset"
-    elif any(k in p for k in ["black and white","monochrome","mono","grayscale"]): key="mono"
-    elif any(k in p for k in ["candy","pastel","sweet"]): key="candy"
-    else:
-        # pick based on hash
-        keys = list(pal.keys())
-        key = keys[stable_hash_int(prompt) % len(keys)]
-
-    return [srgb_to_lin(hex_to_rgb01(hx)) for hx in pal[key]]
-
-# ------------------ Generation Model ------------------
-# Lightweight iterative graph denoising, edge-aware + prompt palette bias.
-# Produces ONE final colors array.
-
-def build_neighbor_lists(edges: np.ndarray, N: int) -> List[List[int]]:
-    nbr = [[] for _ in range(N)]
-    for i,j in edges.astype(np.int64):
-        nbr[int(i)].append(int(j)); nbr[int(j)].append(int(i))
-    return nbr
-
-def prompt_field(g: TriangleGraph, palette: List[np.ndarray], prompt: str, seed: int) -> np.ndarray:
-    """
-    Create a smooth prompt-conditioned color field across triangles.
-    Uses centroid position + hashed prompt direction + palette interpolation.
-    """
-    rng = np.random.default_rng(int(seed))
-    ctr = np.mean(g.tris, axis=1)  # (N,2)
-    x = ctr[:,0] / max(1.0,g.width)
-    y = ctr[:,1] / max(1.0,g.height)
-
-    dx, dy = parse_light(prompt)
-    # projection for "lighting direction"
-    proj = dx*(x-0.5) + dy*(y-0.5)
-    proj = (proj - proj.min()) / (np.ptp(proj) + 1e-8)
-
-    # a second axis for variety
-    proj2 = (x + 0.6*y + 0.17*np.sin(2*math.pi*(x-y))) % 1.0
-
-    # mix palette stops
-    K = len(palette)
-    t = 0.65*proj + 0.35*proj2
-    t = np.clip(t, 0.0, 0.999999)
-    pos = t*(K-1)
-    i0 = np.floor(pos).astype(np.int32)
-    i1 = np.clip(i0+1, 0, K-1)
-    a = (pos - i0.astype(np.float32)).astype(np.float32)
-
-    base = (1-a)[:,None]*np.stack([palette[i] for i in i0],0) + a[:,None]*np.stack([palette[i] for i in i1],0)
-
-    # small prompt texture
-    tex = rng.normal(0.0, 0.03, size=base.shape).astype(np.float32)
-    return np.clip(base + tex, 0.0, 1.0).astype(np.float32)
-
-def generate_colors(model: Dict, g: TriangleGraph, prompt: str, seed: int, steps: int, neighbor_w: float, prompt_w: float, edge_preserve: float, temperature: float) -> np.ndarray:
-    rng = np.random.default_rng(int(seed))
-    N = g.tris.shape[0]
-    nbr = build_neighbor_lists(g.edges, N)
-
-    palette = pick_palette(model, prompt)
-    pf = prompt_field(g, palette, prompt, seed=seed+1234)
-
-    # initialize with palette-biased noise
-    x = np.clip(pf + rng.normal(0.0, 0.25*temperature, size=(N,3)).astype(np.float32), 0.0, 1.0)
-
-    es = np.clip(g.edge_strength.astype(np.float32), 0.0, 1.0)  # (N,)
-    # edge-preserve mask: where edges strong, resist smoothing
-    resist = edge_preserve * es  # 0..edge_preserve
-
-    for _ in range(int(steps)):
-        x_new = x.copy()
-        # neighbor mean
-        for i in range(N):
-            ns = nbr[i]
-            if ns:
-                m = np.mean(x[ns], axis=0)
-            else:
-                m = x[i]
-            # smooth more where edges are weak
-            w_smooth = neighbor_w * (1.0 - resist[i])
-            # pull toward prompt field always a bit
-            x_new[i] = (1.0 - w_smooth - prompt_w) * x[i] + w_smooth * m + prompt_w * pf[i]
-
-        # mild contrast boost aligned with edges
-        # encourages separation along structural edges
-        if g.edges.shape[0] > 0:
-            i = g.edges[:,0].astype(np.int64); j = g.edges[:,1].astype(np.int64)
-            d = x_new[i] - x_new[j]
-            mag = np.sqrt(np.sum(d*d, axis=1) + 1e-12)
-            # push apart along strong edges
-            push = (0.12 * (g.edge_strength[i] + g.edge_strength[j]) / 2.0)[:,None]
-            x_new[i] = np.clip(x_new[i] + push * d, 0.0, 1.0)
-            x_new[j] = np.clip(x_new[j] - push * d, 0.0, 1.0)
-
-        # anneal small noise
-        x_new = np.clip(x_new + rng.normal(0.0, 0.02*temperature, size=x_new.shape).astype(np.float32), 0.0, 1.0)
-        x = x_new
-
-    return np.clip(x, 0.0, 1.0).astype(np.float32)
-
-
 # ------------------ Preference Training (A/B) ------------------
-# Stored inside model.json:
-#   model["pref"] = { "w": [...], "feat_mean": [...], "feat_std": [...], "lr": 0.15, "l2": 0.01, "n": 0 }
-#   model["pref_pairs"] = [ { "fa": [...], "fb": [...], "y": 1.0 } , ... ]
-#
-# We keep this lightweight and deterministic. The preference model helps rank candidates in training,
-# and can optionally recommend parameter tweaks (future extension).
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
     x = np.clip(x, -60.0, 60.0)
@@ -478,7 +537,6 @@ def edge_deltas(g: TriangleGraph, colors_lin: np.ndarray) -> np.ndarray:
     return (colors_lin[i] - colors_lin[j]).astype(np.float32)
 
 def compute_quality_features(g: TriangleGraph, colors_lin: np.ndarray) -> np.ndarray:
-    # K=12 stable features
     d = edge_deltas(g, colors_lin)
     if d.shape[0] == 0:
         var = np.var(colors_lin, axis=0)
@@ -489,8 +547,7 @@ def compute_quality_features(g: TriangleGraph, colors_lin: np.ndarray) -> np.nda
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         ], dtype=np.float32)
 
-    dist = np.sqrt(np.sum(d*d, axis=1) + 1e-12)  # (E,)
-    # edge strength per edge (mean of endpoints)
+    dist = np.sqrt(np.sum(d*d, axis=1) + 1e-12)
     es = np.clip(g.edge_strength.astype(np.float32), 0.0, 1.0)
     i = g.edges[:,0].astype(np.int64); j = g.edges[:,1].astype(np.int64)
     s = 0.5*(es[i] + es[j])
@@ -530,19 +587,10 @@ def compute_quality_features(g: TriangleGraph, colors_lin: np.ndarray) -> np.nda
     ], dtype=np.float32)
     return feats
 
-def ensure_pref_in_model(model: Dict) -> Dict:
-    if "pref" not in model or not isinstance(model["pref"], dict):
-        model["pref"] = {
-            "w": [0.0]*12,
-            "feat_mean": [0.0]*12,
-            "feat_std": [1.0]*12,
-            "lr": 0.15,
-            "l2": 0.01,
-            "n": 0
-        }
-    if "pref_pairs" not in model or not isinstance(model["pref_pairs"], list):
-        model["pref_pairs"] = []
-    return model
+def ensure_pref(model: Dict) -> None:
+    model.setdefault("pref", {"w":[0.0]*12,"feat_mean":[0.0]*12,"feat_std":[1.0]*12,"lr":0.15,"l2":0.01,"n":0})
+    model.setdefault("pref_pairs", [])
+    model.setdefault("training", {"tune_rate":0.05,"max_history":4000})
 
 def pref_score(model: Dict, feats: np.ndarray) -> float:
     p = model["pref"]
@@ -558,11 +606,10 @@ def update_pref_stats(model: Dict, feats_all: np.ndarray) -> None:
     model["pref"]["feat_mean"] = np.mean(feats_all, axis=0).astype(np.float32).tolist()
     model["pref"]["feat_std"] = (np.std(feats_all, axis=0) + 1e-6).astype(np.float32).tolist()
 
-def train_pref_model(model: Dict, steps: int = 200) -> None:
+def train_pref(model: Dict, steps: int = 200) -> None:
     pairs = model.get("pref_pairs", [])
     if len(pairs) < 2:
-        model["pref"]["n"] = len(pairs)
-        return
+        model["pref"]["n"] = len(pairs); return
     A = np.stack([np.array(p["fa"], dtype=np.float32) for p in pairs], axis=0)
     B = np.stack([np.array(p["fb"], dtype=np.float32) for p in pairs], axis=0)
     y = np.array([float(p["y"]) for p in pairs], dtype=np.float32)
@@ -572,26 +619,42 @@ def train_pref_model(model: Dict, steps: int = 200) -> None:
 
     mu = np.array(model["pref"]["feat_mean"], dtype=np.float32)
     sd = np.array(model["pref"]["feat_std"], dtype=np.float32) + 1e-6
-    Az = (A - mu[None,:])/sd[None,:]
-    Bz = (B - mu[None,:])/sd[None,:]
-    X = Az - Bz
+    X = (A - mu[None,:])/sd[None,:] - (B - mu[None,:])/sd[None,:]
 
     w = np.array(model["pref"]["w"], dtype=np.float32)
     lr = float(model["pref"].get("lr", 0.15))
     l2 = float(model["pref"].get("l2", 0.01))
     n = X.shape[0]
-
     for _ in range(int(steps)):
-        logits = X @ w
-        p = sigmoid(logits)
+        p = sigmoid(X @ w)
         grad = (X.T @ (p - y)) / max(1.0, float(n)) + l2*w
         w = w - lr*grad.astype(np.float32)
 
     model["pref"]["w"] = w.astype(np.float32).tolist()
     model["pref"]["n"] = len(pairs)
 
-def save_model_json(model: Dict) -> None:
-    # Writes to local working directory (Streamlit Cloud writable at runtime)
+def maybe_autotune_defaults(model: Dict, chosen_is_a: bool, params_a: Dict, params_b: Dict) -> None:
+    """
+    Optional: after a preference, nudge defaults toward winning params.
+    This makes the generator improve even if you never use scoring.
+    """
+    if not model.get("defaults", {}).get("auto_tune_defaults", True):
+        return
+    tr = model.get("training", {})
+    rate = float(tr.get("tune_rate", 0.05))
+    win = params_a if chosen_is_a else params_b
+    lose = params_b if chosen_is_a else params_a
+
+    # only tune a curated subset (keeps stable)
+    keys = ["neighbor_weight","prompt_weight","edge_preserve","temperature","multi_scale","quantize_strength","micro_texture","contrast_boost"]
+    for k in keys:
+        if k in win and k in lose and k in model["defaults"]:
+            wv = float(win[k]); lv = float(lose[k])
+            dv = wv - lv
+            cur = float(model["defaults"][k])
+            model["defaults"][k] = float(np.clip(cur + rate*dv, 0.0, 2.5))
+
+def save_model(model: Dict) -> None:
     with open("model.json","w",encoding="utf-8") as f:
         json.dump(model, f, indent=2)
 
@@ -599,24 +662,25 @@ def save_model_json(model: Dict) -> None:
 # Streamlit App
 # ============================================================
 
-st.set_page_config(page_title="TriangleGraph Text-to-Image", page_icon="🔺", layout="wide")
-st.title("🔺 TriangleGraph Text-to-Image (No Torch)")
-st.caption("Generates ONE triangle-mosaic image per click from a text prompt. Streamlit-friendly.")
+st.set_page_config(page_title="TriangleGraph Text-to-Image v2", page_icon="🔺", layout="wide")
+st.title("🔺 TriangleGraph Text-to-Image — v2 (No Torch)")
+st.caption("Stronger prompt conditioning + stained-glass look + training mode.")
 
-# Load model.json from local folder
 @st.cache_data(show_spinner=False)
 def load_model() -> Dict:
     with open("model.json","r",encoding="utf-8") as f:
         return json.load(f)
 
-MODEL = ensure_pref_in_model(load_model())
+MODEL = load_model()
+ensure_pref(MODEL)
 
 tab1, tab2, tab3 = st.tabs(["Text → Image", "Image → Triangle Mosaic", "Train (A/B)"])
 
 # -------------------- Text → Image --------------------
 with tab1:
-    st.subheader("Text → Image")
-    prompt = st.text_input("Prompt", value="ocean sunset, light from left, stained glass")
+    st.subheader("Text → Image (Generates ONE image per click)")
+    prompt = st.text_input("Prompt", value="ocean sunset, stained glass, light from left")
+
     colA, colB, colC, colD = st.columns(4)
     with colA:
         width = st.select_slider("Width", options=[384, 512, 640, 768, 896, 1024], value=768)
@@ -625,20 +689,43 @@ with tab1:
     with colC:
         complexity = st.slider("Complexity (more triangles)", 1, 10, 6, 1)
     with colD:
-        seed = st.number_input("Seed", min_value=0, max_value=10_000_000, value=stable_hash_int(prompt) % 10_000_000, step=1)
+        seed_default = stable_hash_int(prompt) % 10_000_000
+        seed = st.number_input("Seed", min_value=0, max_value=10_000_000, value=int(seed_default), step=1)
+
+    style = detect_style(MODEL, prompt)
+    style_cfg = MODEL.get("styles", {}).get(style, {})
+    st.write(f"Detected style: **{style}**")
 
     st.markdown("### Style controls")
+    d = MODEL.get("defaults", {})
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        steps = st.slider("Steps", 10, 120, int(MODEL["defaults"]["steps"]), 1)
+        steps = st.slider("Steps", 10, 140, int(d.get("steps", 40)), 1)
     with c2:
-        neighbor_w = st.slider("Neighbor smooth", 0.10, 0.90, float(MODEL["defaults"]["neighbor_weight"]), 0.01)
+        neighbor_w = st.slider("Neighbor smooth", 0.10, 0.92, float(d.get("neighbor_weight", 0.62)), 0.01)
     with c3:
-        prompt_w = st.slider("Prompt pull", 0.00, 0.60, float(MODEL["defaults"]["prompt_weight"]), 0.01)
+        prompt_w = st.slider("Prompt pull", 0.00, 0.65, float(d.get("prompt_weight", 0.28)), 0.01)
     with c4:
-        edge_preserve = st.slider("Edge preserve", 0.00, 0.70, float(MODEL["defaults"]["edge_preserve"]), 0.01)
+        edge_preserve = st.slider("Edge preserve", 0.00, 0.75, float(d.get("edge_preserve", 0.22)), 0.01)
     with c5:
-        temperature = st.slider("Randomness", 0.10, 1.40, float(MODEL["defaults"]["temperature"]), 0.05)
+        temperature = st.slider("Randomness", 0.10, 1.50, float(d.get("temperature", 0.85)), 0.05)
+
+    st.markdown("### Advanced (quality boosters)")
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        multi_scale = st.slider("Multi-scale structure", 0.0, 1.0, float(d.get("multi_scale", 0.55)), 0.01)
+    with a2:
+        quantize_strength = st.slider("Palette quantize", 0.0, 0.85, float(d.get("quantize_strength", 0.45)), 0.01)
+    with a3:
+        micro_texture = st.slider("Glass grain", 0.0, 0.55, float(d.get("micro_texture", 0.22)), 0.01)
+    with a4:
+        contrast_boost = st.slider("Edge contrast", 0.0, 0.25, float(d.get("contrast_boost", 0.08)), 0.01)
+
+    # blend in style defaults subtly
+    quantize_strength = float(np.clip(0.70*quantize_strength + 0.30*float(style_cfg.get("quantize_strength", quantize_strength)), 0.0, 0.85))
+    micro_texture = float(np.clip(0.70*micro_texture + 0.30*float(style_cfg.get("micro_texture", micro_texture)), 0.0, 0.55))
+    contrast_boost = float(np.clip(0.70*contrast_boost + 0.30*float(style_cfg.get("contrast_boost", contrast_boost)), 0.0, 0.25))
+    lead_line_strength = float(style_cfg.get("lead_line_strength", 0.25))
 
     st.markdown("### Render controls")
     r1, r2, r3, r4 = st.columns(4)
@@ -649,27 +736,32 @@ with tab1:
     with r3:
         outline = st.checkbox("Outlines", value=False)
     with r4:
-        outline_px = st.slider("Outline width", 1, 5, 1, 1) if outline else 1
+        outline_px = st.slider("Outline width", 1, 6, 1, 1) if outline else 1
         outline_alpha = st.slider("Outline opacity", 0.05, 1.0, 0.25, 0.01) if outline else 0.25
 
-    # Procedural graph params derived from complexity
-    # higher complexity => smaller min_cell and higher depth/split_prob
+    diag_mode = st.selectbox("Diagonal mode", ["Random","Alternate","TL-BR","TR-BL"], index=0)
+
+    # graph params derived from complexity
     min_cell = int(max(10, 70 - 5*complexity))
     max_depth = int(min(9, 3 + complexity//2))
     split_prob = float(np.clip(0.35 + 0.06*complexity, 0.35, 0.92))
 
-    diag_mode = st.selectbox("Diagonal mode", ["Random","Alternate","TL-BR","TR-BL"], index=0)
-
     gen = st.button("Generate image", type="primary", use_container_width=True)
 
     if gen:
-        # Ensure only ONE image generation per click; avoid storing huge objects in session.
+        t0 = time.time()
         with st.spinner("Generating (one image)…"):
             g = build_procedural_graph(int(width), int(height), ProcParams(min_cell=min_cell, max_depth=max_depth, split_prob=split_prob, diag_mode=diag_mode), seed=int(seed))
-            colors = generate_colors(MODEL, g, prompt=prompt, seed=int(seed), steps=int(steps),
-                                     neighbor_w=float(neighbor_w), prompt_w=float(prompt_w),
-                                     edge_preserve=float(edge_preserve), temperature=float(temperature))
-            img = render_mosaic(g, colors, gap_px=float(gap), background=bg, outline=outline, outline_px=int(outline_px), outline_alpha=float(outline_alpha))
+            colors = generate_colors(
+                MODEL, g, prompt=prompt, seed=int(seed), steps=int(steps),
+                neighbor_w=float(neighbor_w), prompt_w=float(prompt_w),
+                edge_preserve=float(edge_preserve), temperature=float(temperature),
+                multi_scale=float(multi_scale), quantize_strength=float(quantize_strength),
+                micro_texture=float(micro_texture), contrast_boost=float(contrast_boost),
+            )
+            img = render_mosaic(g, colors, gap_px=float(gap), background=bg, outline=outline,
+                                outline_px=int(outline_px), outline_alpha=float(outline_alpha),
+                                lead_line_strength=lead_line_strength)
 
             buf = io.BytesIO()
             img.save(buf, format="PNG")
@@ -677,15 +769,18 @@ with tab1:
 
         st.image(png_bytes, use_container_width=True)
         st.download_button("Download PNG", data=png_bytes, file_name="trianglegraph_text2image.png", mime="image/png", use_container_width=True)
+        st.caption(f"Generated in {time.time()-t0:.2f}s • triangles={int(g.tris.shape[0])} • edges={int(g.edges.shape[0])}")
 
         with st.expander("Generation details", expanded=False):
             st.write({
+                "prompt": prompt, "style": style,
                 "width": width, "height": height, "seed": int(seed),
-                "min_cell": min_cell, "max_depth": max_depth, "split_prob": split_prob,
+                "min_cell": min_cell, "max_depth": max_depth, "split_prob": split_prob, "diag_mode": diag_mode,
                 "steps": int(steps),
                 "neighbor_w": float(neighbor_w), "prompt_w": float(prompt_w),
                 "edge_preserve": float(edge_preserve), "temperature": float(temperature),
-                "triangles": int(g.tris.shape[0]), "edges": int(g.edges.shape[0])
+                "multi_scale": float(multi_scale), "quantize_strength": float(quantize_strength),
+                "micro_texture": float(micro_texture), "contrast_boost": float(contrast_boost),
             })
 
 # -------------------- Image → Triangle Mosaic --------------------
@@ -699,14 +794,10 @@ with tab2:
         img = resize_keep_aspect(img, int(max_side))
 
         c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            min_cell = st.slider("Min cell (px)", 6, 80, 18, 1)
-        with c2:
-            max_depth = st.slider("Max depth", 2, 10, 7, 1)
-        with c3:
-            var_thresh = st.slider("Var thresh", 0.05, 1.0, 0.55, 0.01)
-        with c4:
-            edge_thresh = st.slider("Edge thresh", 0.05, 1.0, 0.45, 0.01)
+        with c1: min_cell = st.slider("Min cell (px)", 6, 80, 18, 1)
+        with c2: max_depth = st.slider("Max depth", 2, 10, 7, 1)
+        with c3: var_thresh = st.slider("Var thresh", 0.05, 1.0, 0.55, 0.01)
+        with c4: edge_thresh = st.slider("Edge thresh", 0.05, 1.0, 0.45, 0.01)
 
         edge_weight = st.slider("Edge weighting", 0.0, 1.0, 0.60, 0.01)
         diag_mode = st.selectbox("Diagonal mode", ["Random","Alternate","TL-BR","TR-BL"], index=0, key="img_diag")
@@ -715,7 +806,7 @@ with tab2:
         gap = st.slider("Whitespace gap (px)", 0.0, 28.0, 8.0, 0.5, key="img_gap")
         bg = st.radio("Background", ["White","Black"], horizontal=True, key="img_bg")
         outline = st.checkbox("Outlines", value=False, key="img_out")
-        outline_px = st.slider("Outline width", 1, 5, 1, 1, key="img_opx") if outline else 1
+        outline_px = st.slider("Outline width", 1, 6, 1, 1, key="img_opx") if outline else 1
         outline_alpha = st.slider("Outline opacity", 0.05, 1.0, 0.25, 0.01, key="img_oal") if outline else 0.25
 
         run = st.button("Convert image", type="primary", use_container_width=True)
@@ -725,7 +816,9 @@ with tab2:
                                 var_thresh=float(var_thresh), edge_thresh=float(edge_thresh),
                                 edge_weight=float(edge_weight), diag_mode=diag_mode)
                 g, cols = build_graph_from_image(img, qp, seed=int(seed))
-                out = render_mosaic(g, cols, gap_px=float(gap), background=bg, outline=outline, outline_px=int(outline_px), outline_alpha=float(outline_alpha))
+                out = render_mosaic(g, cols, gap_px=float(gap), background=bg, outline=outline,
+                                    outline_px=int(outline_px), outline_alpha=float(outline_alpha),
+                                    lead_line_strength=0.0)
                 buf = io.BytesIO()
                 out.save(buf, format="PNG")
                 png = buf.getvalue()
@@ -733,95 +826,111 @@ with tab2:
             st.image(png, use_container_width=True)
             st.download_button("Download PNG", data=png, file_name="trianglegraph_from_image.png", mime="image/png", use_container_width=True)
 
-
 # -------------------- Train (A/B) --------------------
 with tab3:
-    st.subheader("Train (A/B Preferences)")
+    st.subheader("Train (A/B Preferences) — improves your generator over time")
     st.write(
-        "Generate two candidates **A** and **B** and pick which one is better. "
-        "Your choices train a small preference model that is saved into **model.json**."
+        "This tab intentionally generates **two** candidates (A and B) so you can choose the better one. "
+        "It updates a lightweight preference model and can auto-tune defaults in `model.json`.\n\n"
+        "If you want training without showing two images at once, ask and I'll convert this into a 2-click sequential trainer."
     )
 
-    # Training controls
     c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        t_width = st.select_slider("Width", options=[384, 512, 640, 768, 896, 1024], value=768, key="t_w")
-    with c2:
-        t_height = st.select_slider("Height", options=[384, 512, 640, 768, 896, 1024], value=768, key="t_h")
-    with c3:
-        t_complexity = st.slider("Complexity", 1, 10, 6, 1, key="t_c")
-    with c4:
-        t_seed = st.number_input("Base seed", min_value=0, max_value=10_000_000, value=9001, step=1, key="t_seed")
+    with c1: t_width = st.select_slider("Width", options=[384, 512, 640, 768, 896, 1024], value=768, key="t_w")
+    with c2: t_height = st.select_slider("Height", options=[384, 512, 640, 768, 896, 1024], value=768, key="t_h")
+    with c3: t_complexity = st.slider("Complexity", 1, 10, 6, 1, key="t_c")
+    with c4: t_seed = st.number_input("Base seed", min_value=0, max_value=10_000_000, value=9001, step=1, key="t_seed")
 
     t_prompt = st.text_input("Prompt", value="neon cyber stained glass, light from top-right", key="t_prompt")
 
-    st.markdown("### Style exploration")
-    s1, s2, s3, s4, s5 = st.columns(5)
-    with s1:
-        t_steps = st.slider("Steps", 10, 120, int(MODEL["defaults"]["steps"]), 1, key="t_steps")
-    with s2:
-        t_neighbor = st.slider("Neighbor smooth", 0.10, 0.90, float(MODEL["defaults"]["neighbor_weight"]), 0.01, key="t_nei")
-    with s3:
-        t_promptw = st.slider("Prompt pull", 0.00, 0.60, float(MODEL["defaults"]["prompt_weight"]), 0.01, key="t_pp")
+    st.markdown("### A/B generation knobs")
+    d = MODEL.get("defaults", {})
+    s1, s2, s3, s4 = st.columns(4)
+    with s1: t_steps = st.slider("Steps", 10, 140, int(d.get("steps", 40)), 1, key="t_steps")
+    with s2: t_temp = st.slider("Randomness", 0.10, 1.50, float(d.get("temperature", 0.85)), 0.05, key="t_tmp")
+    with s3: spread = st.slider("Param exploration", 0.00, 0.30, 0.10, 0.01, key="t_sp")
     with s4:
-        t_edgep = st.slider("Edge preserve", 0.00, 0.70, float(MODEL["defaults"]["edge_preserve"]), 0.01, key="t_ep")
-    with s5:
-        t_temp = st.slider("Randomness", 0.10, 1.40, float(MODEL["defaults"]["temperature"]), 0.05, key="t_tmp")
-
-    st.markdown("### Preference model settings")
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        MODEL["pref"]["lr"] = st.slider("Pref learning rate", 0.02, 0.50, float(MODEL["pref"].get("lr", 0.15)), 0.01, key="p_lr")
-    with p2:
-        MODEL["pref"]["l2"] = st.slider("Pref L2", 0.0, 0.20, float(MODEL["pref"].get("l2", 0.01)), 0.005, key="p_l2")
-    with p3:
-        train_steps = st.slider("Train steps per click", 50, 600, 200, 25, key="p_steps")
+        train_steps = st.slider("Pref train steps per vote", 50, 600, 200, 25, key="t_tr")
 
     diag_mode = st.selectbox("Diagonal mode", ["Random","Alternate","TL-BR","TR-BL"], index=0, key="t_diag")
 
     r1, r2, r3 = st.columns(3)
-    with r1:
-        t_gap = st.slider("Whitespace gap (px)", 0.0, 28.0, 10.0, 0.5, key="t_gap")
-    with r2:
-        t_bg = st.radio("Background", ["White","Black"], horizontal=True, key="t_bg")
+    with r1: t_gap = st.slider("Whitespace gap (px)", 0.0, 28.0, 10.0, 0.5, key="t_gap")
+    with r2: t_bg = st.radio("Background", ["White","Black"], horizontal=True, key="t_bg")
     with r3:
         t_outline = st.checkbox("Outlines", value=False, key="t_out")
-        t_opx = st.slider("Outline width", 1, 5, 1, 1, key="t_opx") if t_outline else 1
+        t_opx = st.slider("Outline width", 1, 6, 1, 1, key="t_opx") if t_outline else 1
         t_oal = st.slider("Outline opacity", 0.05, 1.0, 0.25, 0.01, key="t_oal") if t_outline else 0.25
 
-    # Procedural graph params
+    # graph params from complexity
     min_cell = int(max(10, 70 - 5*t_complexity))
     max_depth = int(min(9, 3 + t_complexity//2))
     split_prob = float(np.clip(0.35 + 0.06*t_complexity, 0.35, 0.92))
 
     gen_pair = st.button("Generate A/B pair", type="primary", use_container_width=True)
 
+    def jitter_param(v: float, lo: float, hi: float, rng: np.random.Generator) -> float:
+        return float(np.clip(v + rng.normal(0.0, spread), lo, hi))
+
     if gen_pair:
+        rng = np.random.default_rng(int(t_seed))
         with st.spinner("Generating A and B…"):
             g = build_procedural_graph(int(t_width), int(t_height),
                                        ProcParams(min_cell=min_cell, max_depth=max_depth, split_prob=split_prob, diag_mode=diag_mode),
                                        seed=int(t_seed))
 
-            # Candidate A
+            style = detect_style(MODEL, t_prompt)
+            style_cfg = MODEL.get("styles", {}).get(style, {})
+            lead = float(style_cfg.get("lead_line_strength", 0.25))
+
+            # Candidate A (baseline defaults with small jitter)
+            params_a = {
+                "neighbor_weight": jitter_param(float(d.get("neighbor_weight",0.62)), 0.10, 0.92, rng),
+                "prompt_weight": jitter_param(float(d.get("prompt_weight",0.28)), 0.00, 0.65, rng),
+                "edge_preserve": jitter_param(float(d.get("edge_preserve",0.22)), 0.00, 0.75, rng),
+                "temperature": float(t_temp),
+                "multi_scale": jitter_param(float(d.get("multi_scale",0.55)), 0.00, 1.00, rng),
+                "quantize_strength": jitter_param(float(d.get("quantize_strength",0.45)), 0.00, 0.85, rng),
+                "micro_texture": jitter_param(float(d.get("micro_texture",0.22)), 0.00, 0.55, rng),
+                "contrast_boost": jitter_param(float(d.get("contrast_boost",0.08)), 0.00, 0.25, rng),
+            }
             colors_a = generate_colors(MODEL, g, prompt=t_prompt, seed=int(t_seed)+7, steps=int(t_steps),
-                                       neighbor_w=float(t_neighbor), prompt_w=float(t_promptw),
-                                       edge_preserve=float(t_edgep), temperature=float(t_temp))
-            img_a = render_mosaic(g, colors_a, gap_px=float(t_gap), background=t_bg, outline=t_outline, outline_px=int(t_opx), outline_alpha=float(t_oal))
+                                       neighbor_w=params_a["neighbor_weight"], prompt_w=params_a["prompt_weight"],
+                                       edge_preserve=params_a["edge_preserve"], temperature=params_a["temperature"],
+                                       multi_scale=params_a["multi_scale"], quantize_strength=params_a["quantize_strength"],
+                                       micro_texture=params_a["micro_texture"], contrast_boost=params_a["contrast_boost"])
+            img_a = render_mosaic(g, colors_a, gap_px=float(t_gap), background=t_bg, outline=t_outline,
+                                  outline_px=int(t_opx), outline_alpha=float(t_oal), lead_line_strength=lead)
             fa = compute_quality_features(g, colors_a)
 
-            # Candidate B (perturb seed a bit)
+            # Candidate B (different seed + jitter)
+            params_b = {
+                "neighbor_weight": jitter_param(float(d.get("neighbor_weight",0.62)), 0.10, 0.92, rng),
+                "prompt_weight": jitter_param(float(d.get("prompt_weight",0.28)), 0.00, 0.65, rng),
+                "edge_preserve": jitter_param(float(d.get("edge_preserve",0.22)), 0.00, 0.75, rng),
+                "temperature": float(t_temp),
+                "multi_scale": jitter_param(float(d.get("multi_scale",0.55)), 0.00, 1.00, rng),
+                "quantize_strength": jitter_param(float(d.get("quantize_strength",0.45)), 0.00, 0.85, rng),
+                "micro_texture": jitter_param(float(d.get("micro_texture",0.22)), 0.00, 0.55, rng),
+                "contrast_boost": jitter_param(float(d.get("contrast_boost",0.08)), 0.00, 0.25, rng),
+            }
             colors_b = generate_colors(MODEL, g, prompt=t_prompt, seed=int(t_seed)+1007, steps=int(t_steps),
-                                       neighbor_w=float(np.clip(t_neighbor + 0.03, 0.10, 0.90)),
-                                       prompt_w=float(np.clip(t_promptw + 0.02, 0.0, 0.60)),
-                                       edge_preserve=float(t_edgep), temperature=float(t_temp))
-            img_b = render_mosaic(g, colors_b, gap_px=float(t_gap), background=t_bg, outline=t_outline, outline_px=int(t_opx), outline_alpha=float(t_oal))
+                                       neighbor_w=params_b["neighbor_weight"], prompt_w=params_b["prompt_weight"],
+                                       edge_preserve=params_b["edge_preserve"], temperature=params_b["temperature"],
+                                       multi_scale=params_b["multi_scale"], quantize_strength=params_b["quantize_strength"],
+                                       micro_texture=params_b["micro_texture"], contrast_boost=params_b["contrast_boost"])
+            img_b = render_mosaic(g, colors_b, gap_px=float(t_gap), background=t_bg, outline=t_outline,
+                                  outline_px=int(t_opx), outline_alpha=float(t_oal), lead_line_strength=lead)
             fb = compute_quality_features(g, colors_b)
 
-            # Store in session (small: store PNG bytes + features)
             buf = io.BytesIO(); img_a.save(buf, format="PNG"); a_png = buf.getvalue()
             buf = io.BytesIO(); img_b.save(buf, format="PNG"); b_png = buf.getvalue()
 
-        st.session_state["ab_pair"] = {"a_png": a_png, "b_png": b_png, "fa": fa.tolist(), "fb": fb.tolist()}
+        st.session_state["ab_pair"] = {
+            "a_png": a_png, "b_png": b_png,
+            "fa": fa.tolist(), "fb": fb.tolist(),
+            "params_a": params_a, "params_b": params_b
+        }
         st.success("Pair generated. Choose A or B below.")
 
     pair = st.session_state.get("ab_pair")
@@ -833,9 +942,11 @@ with tab3:
         with cA:
             st.markdown(f"## A (score {a_sc:.3f})")
             st.image(pair["a_png"], use_container_width=True)
+            st.caption(pair["params_a"])
         with cB:
             st.markdown(f"## B (score {b_sc:.3f})")
             st.image(pair["b_png"], use_container_width=True)
+            st.caption(pair["params_b"])
 
         b1, b2, b3 = st.columns(3)
         choose_a = b1.button("✅ A is better", use_container_width=True)
@@ -843,11 +954,19 @@ with tab3:
         clear = b3.button("↩ Clear", use_container_width=True)
 
         if choose_a or choose_b:
-            entry = {"fa": pair["fa"], "fb": pair["fb"], "y": 1.0 if choose_a else 0.0}
+            chosen_is_a = bool(choose_a)
+            entry = {"fa": pair["fa"], "fb": pair["fb"], "y": 1.0 if chosen_is_a else 0.0}
             MODEL["pref_pairs"].append(entry)
+
+            # keep model.json from growing forever
+            max_hist = int(MODEL.get("training", {}).get("max_history", 4000))
+            if len(MODEL["pref_pairs"]) > max_hist:
+                MODEL["pref_pairs"] = MODEL["pref_pairs"][-max_hist:]
+
             with st.spinner("Training preference model & saving…"):
-                train_pref_model(MODEL, steps=int(train_steps))
-                save_model_json(MODEL)
+                train_pref(MODEL, steps=int(train_steps))
+                maybe_autotune_defaults(MODEL, chosen_is_a, pair["params_a"], pair["params_b"])
+                save_model(MODEL)
             st.success(f"Saved. Comparisons: {len(MODEL['pref_pairs'])} • pref n={MODEL['pref']['n']}")
             st.session_state.pop("ab_pair", None)
 
@@ -859,21 +978,19 @@ with tab3:
     colS1, colS2 = st.columns(2)
     with colS1:
         if st.button("Save model.json now", use_container_width=True):
-            save_model_json(MODEL)
+            save_model(MODEL)
             st.success("Saved model.json")
     with colS2:
-        # Provide download of current model.json
         model_bytes = json.dumps(MODEL, indent=2).encode("utf-8")
         st.download_button("Download model.json", data=model_bytes, file_name="model.json", mime="application/json", use_container_width=True)
 
-    st.markdown("### Preference status")
-    st.write({"comparisons": len(MODEL.get("pref_pairs", [])), "pref": MODEL.get("pref", {})})
+    st.markdown("### Status")
+    st.write({"comparisons": len(MODEL.get("pref_pairs", [])), "defaults": MODEL.get("defaults", {}), "pref": MODEL.get("pref", {})})
 
-
-with st.expander("Notes / Why this won't crash like before", expanded=False):
+with st.expander("Troubleshooting", expanded=False):
     st.write(
-        "- This app generates **exactly one** image per click (no best-of-N loops).\n"
-        "- It avoids caching large numpy arrays in session state.\n"
-        "- It stores only the final PNG bytes for display/download.\n"
-        "- The generation model is deterministic by (prompt, seed) and lightweight.\n"
+        "- If generation feels too 'washed', increase **Edge contrast** and reduce **Neighbor smooth**.\n"
+        "- If it looks too noisy, reduce **Randomness** and increase **Steps**.\n"
+        "- For stained glass: raise **Palette quantize** and **Glass grain**, and enable outlines.\n"
+        "- If you want the generator to improve automatically, do ~25-100 A/B votes and keep Auto-tune enabled.\n"
     )

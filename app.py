@@ -1132,7 +1132,7 @@ with tabs[0]:
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        max_side = st.slider("Max side (px)", 256, 1600, 900, 32)
+        max_side = st.slider("Max side (px)", 256, 16000, 900, 32) # made image 10x size
     with c2:
         min_cell = st.slider("Min cell (px)", 6, 80, 18, 1)
     with c3:
